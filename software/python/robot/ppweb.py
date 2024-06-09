@@ -28,6 +28,10 @@ import picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
 
+from pyrplidar import PyRPlidar
+from scipy.spatial import KDTree
+import numpy as np
+
 
 from flask import Flask, Response, request, render_template, redirect, send_file, jsonify
 
@@ -64,10 +68,11 @@ signal.signal(signal.SIGINT, on_shutdown)
 
 IM_WIDTH = 320
 IM_HEIGHT = 240
+# 320, 240
 
 # set default values
 log_level = logging.INFO
-pose_estimator_rate = 5 # Hz
+pose_estimator_rate = 10 # Hz
 heartbeat_interval = 5  # sec
 
 app = Flask(__name__)
@@ -78,6 +83,9 @@ y = 0
 theta = 0
 pose_reset = False
 
+lidar_state = False
+lidar_points = []
+points_lock = threading.Lock()
 is_shutdown = False
 
 # http://flask.pocoo.org/docs/1.0/quickstart/
@@ -506,6 +514,29 @@ def getencoders():
     log.debug('--- get encoders: %d %d\n' % (ea,eb))
     return "%d,%d" % (ea, eb)
 
+@app.route('/robot/get/lidar')
+def getLidar():
+    with points_lock:
+        log.debug('--- get lidar\n')
+        return repr(lidar_points)
+
+@app.route('/robot/startLidar')
+def startLidar():
+    global lidar_state
+    lidar_state = True
+    val = 1
+    log.debug('--- start lidar: %d\n' % (val))
+    return "%d" % (val)
+
+@app.route('/robot/stopLidar')
+def stopLidar():
+    global lidar_state
+    lidar_state = False
+    val = 1
+    log.debug('--- start lidar: %d\n' % (val))
+    return "%d" % (val)
+
+
 @app.route('/robot/set/velocity')
 def motors():
 
@@ -699,84 +730,33 @@ def IPUpdateThread():
 " Pose estimation thread
 """
 def PoseEstimatorThread():
-    global x, y, theta, pose_reset
+    
+    global lidar_points
+    global lidar_state
+    global is_shutdown
+    log.info('Lidar thread launched, running at %.1f Hz' % args.pose_rate)
 
-    log.info('Pose estimator thread launched, running at %.1f Hz' % args.pose_rate)
-    dt = 1/args.pose_rate
-
-    W = 0.156  # lateral wheel separation
-    wheelDiam = 0.065
-    encScale = math.pi * wheelDiam / 384 
-
-    # read the initial encoders 
-    left = mLeft.get_encoder()
-    right = mRight.get_encoder()
-
-    def encoder_difference(a, b):
-        d = a - b
-        if d > 32000:
-            d = 0x10000 - d
-        elif d < -32000:
-            d += 0x10000
-        return d
-
-    # maximum possible encoder change
-    #  50Hz servo loop has maximum velocity of 20enc/interval
-    #  add a safety factor of 2
-    max_step = 50 / pose_estimator_rate * 20 * 2
-
+    lidar = PyRPlidar()
     while True:
-        # check if there's a request to reset the pose estimate
-        if pose_reset:
-            x = 0
-            y = 0
-            theta = 0
-            pose_reset = False
-
-        # read the encoders 
-        new_left = mLeft.get_encoder()
-        new_right = mRight.get_encoder()
-
-        # check if bad read value
-        if new_left is None or new_right is None:
-            log.error('bad encoder read')
-            continue
-
-        # compute the difference since last sample and handle 16-bit wrapping
-        dL = encoder_difference(new_left, left)
-        dR = encoder_difference(new_right, right)
-
-        # handle case where user resets encoder on the PPI board
-        if abs(dL) > max_step:
-            dL = 0
-        if abs(dR) > max_step:
-            dR = 0
-
-        # stash the previous values
-        left = new_left
-        right = new_right
-
-        # compute average and differential wheel motion
-        #  this is average and differential wheel speed * dt
-        avg = encScale * (dL + dR) / 2
-        diff = encScale * (dL - dR)
-
-        # update the state
-        #   no need to multiply by dt, it's included already
-        theta_old = theta
-        theta += diff / W          # update theta
-        theta_avg = (theta + theta_old)/2   # average theta over the interval
-        x += avg * math.cos(theta_avg)      # update position
-        y += avg * math.sin(theta_avg)
-        #print('Estimated pose %f %f %f (enc=%f %f)' % (x,y,theta,left,right))
-        while theta > 2*math.pi:
-            theta -= 2*math.pi
-        while theta < -2*math.pi:
-            theta += 2*math.pi
-
-        # sleep a bit
-        time.sleep(dt)
-        global is_shutdown
+        if lidar_state:
+            lidar.connect(port="/dev/ttyUSB0", baudrate=460800, timeout=3)
+            scan_generator = lidar.start_scan()
+            points = []
+            while lidar_state:
+                for point in scan_generator():
+                    points.append((point.angle, point.distance))
+                    if len(points) > 540:
+                        with points_lock:
+                            lidar_points = points
+                        points = []
+                    if not lidar_state:
+                        lidar.stop()
+                        lidar.disconnect()
+                        break
+                    # global is_shutdown
+                    if is_shutdown:
+                        lidar_state = False
+                        break
         if is_shutdown:
             break
 
